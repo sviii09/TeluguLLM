@@ -28,6 +28,46 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+        /* Audio recording styles */
+        .recording {
+            background-color: #dc3545 !important;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        .audio-controls {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .mic-button {
+            background-color: #28a745;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            font-size: 24px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .mic-button:hover {
+            background-color: #218838;
+            transform: scale(1.05);
+        }
+        .mic-button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+            transform: none;
+        }
     </style>
 </head>
 <body class="flex items-center justify-center min-h-screen p-4">
@@ -37,12 +77,31 @@
             మీ తెలుగు ప్రశ్నలకు సమాధానం ఇవ్వడానికి నేను సిద్ధంగా ఉన్నాను!
         </p>
 
+        <!-- Audio Recording Controls -->
+        <div class="audio-controls">
+            <button
+                id="micButton"
+                class="mic-button"
+                title="మైక్రోఫోన్ ద్వారా మాట్లాడండి (Speak via microphone)"
+            >
+                🎤
+            </button>
+            <div class="text-center">
+                <div id="recordingStatus" class="text-sm text-gray-600 hidden">
+                    రికార్డింగ్... మాట్లాడండి (Recording... Speak now)
+                </div>
+                <div id="transcriptionResult" class="text-sm text-blue-600 mt-2 hidden">
+                    <!-- Transcription will appear here -->
+                </div>
+            </div>
+        </div>
+
         <div class="mb-6">
             <label for="userInput" class="block text-gray-700 text-lg font-semibold mb-2">మీ ప్రశ్న (Your Question):</label>
             <textarea
                 id="userInput"
                 class="w-full p-4 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-800 h-28 resize-y"
-                placeholder="తెలుగులో మీ ప్రశ్నను ఇక్కడ టైప్ చేయండి..."
+                placeholder="తెలుగులో మీ ప్రశ్నను ఇక్కడ టైప్ చేయండి లేదా మైక్రోఫోన్ ఉపయోగించండి..."
             ></textarea>
         </div>
 
@@ -78,9 +137,19 @@
         const loader = document.getElementById('loader');
         const buttonText = document.getElementById('buttonText');
         const errorMessage = document.getElementById('errorMessage');
+        const micButton = document.getElementById('micButton');
+        const recordingStatus = document.getElementById('recordingStatus');
+        const transcriptionResult = document.getElementById('transcriptionResult');
 
         // IMPORTANT: Ensure this matches the port your Flask backend is running on
         const BACKEND_URL = 'http://127.0.0.1:5000/generate';
+        const TRANSCRIBE_URL = 'http://127.0.0.1:5000/transcribe';
+        const SPEECH_TO_LLM_URL = 'http://127.0.0.1:5000/speech-to-llm';
+
+        // Audio recording variables
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
 
         generateBtn.addEventListener('click', async () => {
             const text = userInput.value.trim();
@@ -122,6 +191,111 @@
                 generateBtn.disabled = false;
             }
         });
+
+        // Audio recording functionality
+        micButton.addEventListener('click', async () => {
+            if (!isRecording) {
+                await startRecording();
+            } else {
+                stopRecording();
+            }
+        });
+
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = (event) => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                    await processAudio(audioBlob);
+                    
+                    // Stop all tracks to release microphone
+                    stream.getTracks().forEach(track => track.stop());
+                };
+
+                mediaRecorder.start();
+                isRecording = true;
+                
+                // Update UI
+                micButton.textContent = '⏹️';
+                micButton.classList.add('recording');
+                micButton.title = 'రికార్డింగ్ ఆపండి (Stop recording)';
+                recordingStatus.classList.remove('hidden');
+                transcriptionResult.classList.add('hidden');
+                errorMessage.classList.add('hidden');
+
+            } catch (error) {
+                console.error('Error accessing microphone:', error);
+                alert('మైక్రోఫోన్ యాక్సెస్ చేయడంలో సమస్య. దయచేసి అనుమతులను తనిఖీ చేయండి. (Error accessing microphone. Please check permissions.)');
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                isRecording = false;
+                
+                // Update UI
+                micButton.textContent = '🎤';
+                micButton.classList.remove('recording');
+                micButton.title = 'మైక్రోఫోన్ ద్వారా మాట్లాడండి (Speak via microphone)';
+                recordingStatus.classList.add('hidden');
+            }
+        }
+
+        async function processAudio(audioBlob) {
+            try {
+                // Show processing status
+                transcriptionResult.innerHTML = 'ఆడియో ప్రాసెస్ అవుతోంది... (Processing audio...)';
+                transcriptionResult.classList.remove('hidden');
+                micButton.disabled = true;
+
+                // Create FormData for audio upload
+                const formData = new FormData();
+                formData.append('audio', audioBlob, 'recording.wav');
+
+                // Send audio for transcription and LLM response
+                const response = await fetch(SPEECH_TO_LLM_URL, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                
+                // Update UI with transcription and LLM response
+                if (data.transcription) {
+                    userInput.value = data.transcription;
+                    transcriptionResult.innerHTML = `📝 ట్రాన్స్క్రిప్షన్: "${data.transcription}"`;
+                }
+                
+                if (data.response) {
+                    llmResponse.value = data.response;
+                }
+
+            } catch (error) {
+                console.error('Error processing audio:', error);
+                transcriptionResult.innerHTML = 'ఆడియో ప్రాసెసింగ్‌లో సమస్య ఏర్పడింది. (Error processing audio.)';
+                errorMessage.classList.remove('hidden');
+            } finally {
+                micButton.disabled = false;
+            }
+        }
+
+        // Check for microphone support
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            micButton.style.display = 'none';
+            console.warn('Microphone access not supported in this browser');
+        }
     </script>
 </body>
 </html>

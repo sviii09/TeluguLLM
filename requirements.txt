@@ -1,0 +1,12 @@
+transformers
+torch
+accelerate
+bitsandbytes
+peft
+trl
+gradio
+datasets
+flask
+flask-cors
+librosa
+numpy

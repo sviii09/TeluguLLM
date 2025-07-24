@@ -2,7 +2,14 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS # To handle Cross-Origin Resource Sharing
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from peft import PeftModel # Only needed if you're loading fine-tuned PEFT adapters
+import librosa
+import numpy as np
+import io
+import base64
+import tempfile
+import os
 
 app = Flask(__name__)
 CORS(app) # Enable CORS for all routes, allowing frontend to access it
@@ -10,6 +17,7 @@ CORS(app) # Enable CORS for all routes, allowing frontend to access it
 # --- Configuration ---
 # Define the pre-trained model ID from Hugging Face Hub.
 MODEL_ID = "Telugu-LLM-Labs/Indic-gemma-7b-finetuned-sft-Navarasa-2.0"
+WHISPER_MODEL_ID = "openai/whisper-large"
 
 # --- Model Loading (This runs once when the Flask app starts) ---
 print(f"Loading tokenizer for model: {MODEL_ID}...")
@@ -17,6 +25,16 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 print("Tokenizer loaded successfully.")
+
+# Load Whisper model for speech-to-text
+print(f"Loading Whisper model: {WHISPER_MODEL_ID}...")
+whisper_processor = WhisperProcessor.from_pretrained(WHISPER_MODEL_ID)
+whisper_model = WhisperForConditionalGeneration.from_pretrained(
+    WHISPER_MODEL_ID,
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
+print("Whisper model loaded successfully.")
 
 print("Configuring BitsAndBytes for quantization...")
 quantization_config = BitsAndBytesConfig(
@@ -84,6 +102,57 @@ def generate_telugu_response_backend(user_input: str) -> str:
     print(f"Generated response from LLM: {response_only}")
     return response_only
 
+# --- Speech-to-Text Function ---
+def transcribe_audio(audio_data: bytes) -> str:
+    """
+    Transcribes audio data to text using Whisper model.
+    Expects audio data as bytes.
+    """
+    try:
+        # Create a temporary file to save the audio data
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_audio:
+            temp_audio.write(audio_data)
+            temp_audio_path = temp_audio.name
+        
+        # Load audio using librosa
+        audio_array, sampling_rate = librosa.load(temp_audio_path, sr=16000)
+        
+        # Clean up temporary file
+        os.unlink(temp_audio_path)
+        
+        # Process audio for Whisper
+        input_features = whisper_processor(
+            audio_array, 
+            sampling_rate=16000, 
+            return_tensors="pt"
+        ).input_features.to(whisper_model.device)
+        
+        # Generate transcription
+        # Force the model to transcribe in Telugu by setting the language
+        forced_decoder_ids = whisper_processor.get_decoder_prompt_ids(
+            language="te", 
+            task="transcribe"
+        )
+        
+        predicted_ids = whisper_model.generate(
+            input_features,
+            forced_decoder_ids=forced_decoder_ids,
+            max_new_tokens=448
+        )
+        
+        # Decode the transcription
+        transcription = whisper_processor.batch_decode(
+            predicted_ids, 
+            skip_special_tokens=True
+        )[0]
+        
+        print(f"Transcribed text: {transcription}")
+        return transcription.strip()
+        
+    except Exception as e:
+        print(f"Error during transcription: {e}")
+        raise e
+
 # --- API Endpoint ---
 @app.route('/generate', methods=['POST'])
 def generate_text():
@@ -106,6 +175,61 @@ def generate_text():
     except Exception as e:
         print(f"Error during LLM generation: {e}")
         return jsonify({"error": "Internal server error during text generation"}), 500
+
+@app.route('/transcribe', methods=['POST'])
+def transcribe_speech():
+    """
+    API endpoint to receive audio data and return transcribed text.
+    Expects audio data in the request.
+    """
+    try:
+        if 'audio' not in request.files:
+            return jsonify({"error": "No audio file provided"}), 400
+        
+        audio_file = request.files['audio']
+        if audio_file.filename == '':
+            return jsonify({"error": "No audio file selected"}), 400
+        
+        # Read audio data
+        audio_data = audio_file.read()
+        
+        # Transcribe audio
+        transcription = transcribe_audio(audio_data)
+        
+        return jsonify({"transcription": transcription})
+        
+    except Exception as e:
+        print(f"Error during transcription: {e}")
+        return jsonify({"error": "Internal server error during transcription"}), 500
+
+@app.route('/speech-to-llm', methods=['POST'])
+def speech_to_llm():
+    """
+    Combined endpoint: transcribe speech and generate LLM response.
+    """
+    try:
+        if 'audio' not in request.files:
+            return jsonify({"error": "No audio file provided"}), 400
+        
+        audio_file = request.files['audio']
+        if audio_file.filename == '':
+            return jsonify({"error": "No audio file selected"}), 400
+        
+        # Read and transcribe audio
+        audio_data = audio_file.read()
+        transcription = transcribe_audio(audio_data)
+        
+        # Generate LLM response from transcription
+        llm_response = generate_telugu_response_backend(transcription)
+        
+        return jsonify({
+            "transcription": transcription,
+            "response": llm_response
+        })
+        
+    except Exception as e:
+        print(f"Error during speech-to-LLM processing: {e}")
+        return jsonify({"error": "Internal server error during speech processing"}), 500
 
 # --- Run the Flask App ---
 if __name__ == '__main__':
