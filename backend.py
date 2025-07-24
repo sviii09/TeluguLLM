@@ -10,6 +10,10 @@ import io
 import base64
 import tempfile
 import os
+import warnings
+
+# Suppress some warnings for cleaner output
+warnings.filterwarnings("ignore", category=UserWarning)
 
 app = Flask(__name__)
 CORS(app) # Enable CORS for all routes, allowing frontend to access it
@@ -17,7 +21,7 @@ CORS(app) # Enable CORS for all routes, allowing frontend to access it
 # --- Configuration ---
 # Define the pre-trained model ID from Hugging Face Hub.
 MODEL_ID = "Telugu-LLM-Labs/Indic-gemma-7b-finetuned-sft-Navarasa-2.0"
-WHISPER_MODEL_ID = "openai/whisper-large"
+WHISPER_MODEL_ID = "openai/whisper-large-v3"  # Using the latest version for better performance
 
 # --- Model Loading (This runs once when the Flask app starts) ---
 print(f"Loading tokenizer for model: {MODEL_ID}...")
@@ -28,13 +32,43 @@ print("Tokenizer loaded successfully.")
 
 # Load Whisper model for speech-to-text
 print(f"Loading Whisper model: {WHISPER_MODEL_ID}...")
-whisper_processor = WhisperProcessor.from_pretrained(WHISPER_MODEL_ID)
-whisper_model = WhisperForConditionalGeneration.from_pretrained(
-    WHISPER_MODEL_ID,
-    torch_dtype=torch.float16,
-    device_map="auto"
-)
-print("Whisper model loaded successfully.")
+try:
+    whisper_processor = WhisperProcessor.from_pretrained(WHISPER_MODEL_ID)
+    whisper_model = WhisperForConditionalGeneration.from_pretrained(
+        WHISPER_MODEL_ID,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        low_cpu_mem_usage=True
+    )
+    whisper_model.eval()  # Set to evaluation mode
+    print("Whisper model loaded successfully.")
+except Exception as e:
+    print(f"Error loading Whisper model: {e}")
+    print("Falling back to whisper-large-v2...")
+    try:
+        WHISPER_MODEL_ID = "openai/whisper-large-v2"
+        whisper_processor = WhisperProcessor.from_pretrained(WHISPER_MODEL_ID)
+        whisper_model = WhisperForConditionalGeneration.from_pretrained(
+            WHISPER_MODEL_ID,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            low_cpu_mem_usage=True
+        )
+        whisper_model.eval()
+        print("Whisper model (v2) loaded successfully.")
+    except Exception as e2:
+        print(f"Error loading Whisper v2: {e2}")
+        print("Falling back to base whisper-large...")
+        WHISPER_MODEL_ID = "openai/whisper-large"
+        whisper_processor = WhisperProcessor.from_pretrained(WHISPER_MODEL_ID)
+        whisper_model = WhisperForConditionalGeneration.from_pretrained(
+            WHISPER_MODEL_ID,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            low_cpu_mem_usage=True
+        )
+        whisper_model.eval()
+        print("Whisper model (base) loaded successfully.")
 
 print("Configuring BitsAndBytes for quantization...")
 quantization_config = BitsAndBytesConfig(
@@ -115,10 +149,23 @@ def transcribe_audio(audio_data: bytes) -> str:
             temp_audio_path = temp_audio.name
         
         # Load audio using librosa
-        audio_array, sampling_rate = librosa.load(temp_audio_path, sr=16000)
+        try:
+            audio_array, sampling_rate = librosa.load(temp_audio_path, sr=16000)
+        except Exception as audio_load_error:
+            print(f"Error loading audio with librosa: {audio_load_error}")
+            # Clean up temporary file before re-raising
+            os.unlink(temp_audio_path)
+            raise audio_load_error
         
         # Clean up temporary file
         os.unlink(temp_audio_path)
+        
+        # Ensure audio is not empty
+        if len(audio_array) == 0:
+            raise ValueError("Audio file is empty or corrupted")
+        
+        # Normalize audio to prevent clipping
+        audio_array = audio_array / np.max(np.abs(audio_array)) if np.max(np.abs(audio_array)) > 0 else audio_array
         
         # Process audio for Whisper
         input_features = whisper_processor(
@@ -129,22 +176,42 @@ def transcribe_audio(audio_data: bytes) -> str:
         
         # Generate transcription
         # Force the model to transcribe in Telugu by setting the language
-        forced_decoder_ids = whisper_processor.get_decoder_prompt_ids(
-            language="te", 
-            task="transcribe"
-        )
+        try:
+            forced_decoder_ids = whisper_processor.get_decoder_prompt_ids(
+                language="te", 
+                task="transcribe"
+            )
+        except Exception as decoder_error:
+            print(f"Error getting decoder prompt IDs: {decoder_error}")
+            # Fallback without forced language
+            forced_decoder_ids = None
         
-        predicted_ids = whisper_model.generate(
-            input_features,
-            forced_decoder_ids=forced_decoder_ids,
-            max_new_tokens=448
-        )
+        # Generate with proper error handling
+        generation_kwargs = {
+            "input_features": input_features,
+            "max_new_tokens": 448,
+            "do_sample": False,  # Use greedy decoding for more consistent results
+            "num_beams": 1,
+        }
+        
+        if forced_decoder_ids is not None:
+            generation_kwargs["forced_decoder_ids"] = forced_decoder_ids
+        
+        with torch.no_grad():  # Ensure no gradients are computed
+            predicted_ids = whisper_model.generate(**generation_kwargs)
         
         # Decode the transcription
         transcription = whisper_processor.batch_decode(
             predicted_ids, 
             skip_special_tokens=True
         )[0]
+        
+        # Clean up the transcription
+        transcription = transcription.strip()
+        
+        # Remove common Whisper artifacts
+        if transcription.lower().startswith("thank you"):
+            transcription = ""
         
         print(f"Transcribed text: {transcription}")
         return transcription.strip()

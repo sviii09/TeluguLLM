@@ -10,3 +10,5 @@ flask
 flask-cors
 librosa
 numpy
+soundfile
+ffmpeg-python
